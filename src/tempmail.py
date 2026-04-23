@@ -389,11 +389,16 @@ def bootstrap_admin(conn):
         conn.execute("insert into users(username,email,password_hash,salt,role,created_at) values(?,?,?,?,?,?)", (username, email, password_hash, salt, "admin", now_iso()))
 def purge_old():
     cutoff=now_iso()
+    mailbox_cutoff=(now_dt()-timedelta(hours=TTL_HOURS)).replace(microsecond=0).isoformat()
     with DB_LOCK, db() as conn:
         conn.execute("delete from attachments where message_id in (select id from messages where expires_at <= ?)", (cutoff,))
         conn.execute("delete from messages where expires_at <= ?", (cutoff,))
         conn.execute("delete from sessions where expires_at <= ?", (cutoff,))
         conn.execute("delete from email_codes where expires_at <= ? or used_at is not null", (cutoff,))
+        stale_boxes=conn.execute("select mailbox from mailbox_creations where created_by='guest' and created_at <= ?", (mailbox_cutoff,)).fetchall()
+        for row in stale_boxes:
+            if not conn.execute("select 1 from messages where mailbox=? and expires_at > ? limit 1", (row["mailbox"], cutoff)).fetchone():
+                conn.execute("delete from mailbox_creations where mailbox=? and created_by='guest'", (row["mailbox"],))
         conn.commit()
 
 def normalize_box(value):
@@ -469,6 +474,17 @@ def mailbox_creation_count(conn, local_date, identity_key, fingerprint_hash):
         row=conn.execute("""select count(*) as c from mailbox_creations where local_date=? and created_by='guest' and identity_key=?""", (local_date, identity_key)).fetchone()
     return int(row["c"] if row else 0)
 
+def release_expired_guest_mailbox(conn, mailbox, now_text=None):
+    now_text=now_text or now_iso()
+    mailbox_cutoff=(datetime.fromisoformat(now_text)-timedelta(hours=TTL_HOURS)).replace(microsecond=0).isoformat()
+    row=conn.execute("select created_at,created_by from mailbox_creations where mailbox=?", (mailbox,)).fetchone()
+    if not row or row["created_by"] != "guest" or row["created_at"] > mailbox_cutoff:
+        return False
+    if conn.execute("select 1 from messages where mailbox=? and expires_at > ? limit 1", (mailbox, now_text)).fetchone():
+        return False
+    conn.execute("delete from mailbox_creations where mailbox=? and created_by='guest'", (mailbox,))
+    return True
+
 def create_guest_mailbox(ip, fingerprint, user_agent, requested_box=""):
     fingerprint=clean_fingerprint(fingerprint); fingerprint_hash=hash_text(fingerprint); identity_key=identity_for(ip, fingerprint)
     user_agent=(user_agent or "")[:500]; local_date=today_utc8(); created=now_iso()
@@ -478,6 +494,7 @@ def create_guest_mailbox(ip, fingerprint, user_agent, requested_box=""):
         if limit is not None and used >= limit: raise RuntimeError("daily mailbox creation limit reached")
         if requested_box:
             mailbox=normalize_recipient_box(requested_box); token=secrets.token_urlsafe(24)
+            release_expired_guest_mailbox(conn, mailbox, created)
             try:
                 conn.execute("""insert into mailbox_creations(mailbox,token,created_at,local_date,ip,fingerprint,fingerprint_hash,identity_key,user_agent,created_by) values(?,?,?,?,?,?,?,?,?,?)""", (mailbox,token,created,local_date,ip,fingerprint,fingerprint_hash,identity_key,user_agent,"guest"))
                 conn.commit(); return {"box":mailbox,"address":f"{mailbox}@{DOMAIN}","token":token,"created_at":created,"used":used+1,"limit":limit}
@@ -504,11 +521,15 @@ def ensure_admin_mailbox(local, handler=None):
 
 def is_known_mailbox(local):
     with DB_LOCK, db() as conn:
+        if release_expired_guest_mailbox(conn, local):
+            conn.commit()
         return conn.execute("select 1 from mailbox_creations where mailbox=?", (local,)).fetchone() is not None
 
 def mailbox_access_ok(local, token):
     if not token: return False
     with DB_LOCK, db() as conn:
+        if release_expired_guest_mailbox(conn, local):
+            conn.commit()
         return conn.execute("select 1 from mailbox_creations where mailbox=? and token=?", (local, token)).fetchone() is not None
 
 def normalize_admin_sender(value):
