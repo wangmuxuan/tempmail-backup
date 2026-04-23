@@ -485,16 +485,28 @@ def release_expired_guest_mailbox(conn, mailbox, now_text=None):
     conn.execute("delete from mailbox_creations where mailbox=? and created_by='guest'", (mailbox,))
     return True
 
+def guest_mailbox_owner_matches(row, identity_key, fingerprint_hash):
+    unknown=hash_text("unknown")
+    return row and row["created_by"] == "guest" and (
+        row["identity_key"] == identity_key or (fingerprint_hash and fingerprint_hash != unknown and row["fingerprint_hash"] == fingerprint_hash)
+    )
+
 def create_guest_mailbox(ip, fingerprint, user_agent, requested_box=""):
     fingerprint=clean_fingerprint(fingerprint); fingerprint_hash=hash_text(fingerprint); identity_key=identity_for(ip, fingerprint)
     user_agent=(user_agent or "")[:500]; local_date=today_utc8(); created=now_iso()
     requested_box=(requested_box or "").strip(); limit=(MAILBOX_DAILY_LIMIT if MAILBOX_DAILY_LIMIT > 0 else None)
     with DB_LOCK, db() as conn:
         used=mailbox_creation_count(conn, local_date, identity_key, fingerprint_hash)
-        if limit is not None and used >= limit: raise RuntimeError("daily mailbox creation limit reached")
         if requested_box:
             mailbox=normalize_recipient_box(requested_box); token=secrets.token_urlsafe(24)
             release_expired_guest_mailbox(conn, mailbox, created)
+            existing=conn.execute("select mailbox,token,created_at,identity_key,fingerprint_hash,created_by from mailbox_creations where mailbox=?", (mailbox,)).fetchone()
+            if existing:
+                if guest_mailbox_owner_matches(existing, identity_key, fingerprint_hash):
+                    return {"box":mailbox,"address":f"{mailbox}@{DOMAIN}","token":existing["token"],"created_at":existing["created_at"],"used":used,"limit":limit}
+                raise RuntimeError("mailbox already exists")
+        if limit is not None and used >= limit: raise RuntimeError("daily mailbox creation limit reached")
+        if requested_box:
             try:
                 conn.execute("""insert into mailbox_creations(mailbox,token,created_at,local_date,ip,fingerprint,fingerprint_hash,identity_key,user_agent,created_by) values(?,?,?,?,?,?,?,?,?,?)""", (mailbox,token,created,local_date,ip,fingerprint,fingerprint_hash,identity_key,user_agent,"guest"))
                 conn.commit(); return {"box":mailbox,"address":f"{mailbox}@{DOMAIN}","token":token,"created_at":created,"used":used+1,"limit":limit}
